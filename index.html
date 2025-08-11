@@ -188,4 +188,118 @@ function drawBokeh(){
   const arr=state.bokeh;
   for(let i=arr.length-1;i>=0;i--){
     const b=arr[i];
-    b.r += b.vr*(1+audio.level*0.8);
+    b.r += b.vr*(1+audio.level*0.8); b.a *= 0.97; b.x += b.vx; b.y += b.vy;
+    if(b.a<0.02) arr.splice(i,1);
+  }
+  // ambient spawn
+  if(arr.length<80 && Math.random()<0.2){
+    arr.push(makeBokeh(Math.random()*W,Math.random()*H, 10+Math.random()*30));
+  }
+  // draw
+  ctx.save();
+  ctx.globalCompositeOperation='screen';
+  for(const b of arr){
+    const grd=ctx.createRadialGradient(b.x,b.y,0,b.x,b.y,b.r);
+    grd.addColorStop(0, b.col);
+    grd.addColorStop(1, b.out);
+    ctx.fillStyle=grd; ctx.globalAlpha=b.a;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+function makeBokeh(x,y,base){
+  const col=pick(PALETTES[paletteIndex]);
+  return {x,y,r:base,vr:0.8+Math.random()*2.2,a:0.9,
+          vx:(Math.random()-0.5)*0.6, vy:(Math.random()-0.5)*0.6,
+          col:hexWithAlpha(col,0.8), out:hexWithAlpha(col,0)}
+}
+function spawnBokehBurst(){
+  const cx=W/2, cy=H/2, n=12+Math.floor(audio.bass*30);
+  for(let i=0;i<n;i++){
+    const ang=Math.random()*TAU, dist=(Math.random()*0.35+0.1)*Math.min(W,H);
+    const x=cx+Math.cos(ang)*dist, y=cy+Math.sin(ang)*dist;
+    state.bokeh.push(makeBokeh(x,y, 20+Math.random()*60));
+  }
+}
+
+/* ===== Mode 3 — EQ Bars (with reflection) ===== */
+function drawBars(){
+  const cols=64, gap=W/cols, baseY=H*0.65;
+  const grad=ctx.createLinearGradient(0,baseY,0,H);
+  grad.addColorStop(0,'rgba(255,255,255,0.20)');
+  grad.addColorStop(1,'rgba(255,255,255,0.0)');
+  for(let i=0;i<cols;i++){
+    const v=bandAt(i,cols);
+    const h=(i/cols*360 + (performance.now()-t0)*0.02)%360;
+    const hgt = v*H*0.45*(0.7+audio.level);
+    ctx.fillStyle=hsl(h,90,55,0.95);
+    const x=i*gap+gap*0.15, w=gap*0.7;
+    ctx.fillRect(x, baseY-hgt, w, hgt);
+    ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=grad;
+    ctx.fillRect(x, baseY+2, w, hgt*0.6); ctx.restore();
+  }
+}
+
+/* ===== Mode 4 — Ribbon Wave (neon lines) ===== */
+function drawRibbon(){
+  const N=256; const arr=new Float32Array(N);
+  if(audio.enabled && audio.an){
+    audio.an.getFloatTimeDomainData(audio.time);
+    const step=Math.max(1, Math.floor(audio.time.length/N));
+    for(let i=0;i<N;i++) arr[i]=audio.time[i*step]||0;
+  }else{
+    const t=performance.now()*0.001; for(let i=0;i<N;i++) arr[i]=Math.sin(i*0.1+t)*0.4*Math.sin(i*0.02);
+  }
+  const lines=3, hueBase=(performance.now()-t0)*0.06;
+  ctx.globalCompositeOperation='screen';
+  for(let k=0;k<lines;k++){
+    const y0 = H*0.5 + (k-1)*30;
+    ctx.beginPath();
+    for(let i=0;i<N;i++){
+      const x=i/(N-1)*W;
+      const y=y0 + arr[i]*H*0.25*(0.7+audio.level*1.2);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.strokeStyle=hsl((hueBase+k*30)%360,90,55,0.9);
+    ctx.lineWidth=2.2 + audio.level*3 + audio.impact*2;
+    ctx.stroke();
+  }
+  ctx.globalCompositeOperation='source-over';
+}
+
+/* ===== Spectrum sampling helpers ===== */
+function bandAt(i,total){
+  if(!(audio.enabled && audio.an)) {
+    const t=performance.now()*0.001;
+    return 0.35*(Math.sin(i*0.3+t*1.3)*0.5+0.5);
+  }
+  const f=audio.fft, n=f.length;
+  const idx=Math.floor(Math.pow(i/Math.max(1,total-1), 1.8) * (n*0.9));
+  return clamp(f[idx]/255, 0, 1);
+}
+
+/* ===== Color utils ===== */
+function hexWithAlpha(hex,a){
+  hex=hex.replace('#',''); if(hex.length===3) hex=hex.split('').map(c=>c+c).join('');
+  const num=parseInt(hex,16), r=(num>>16)&255,g=(num>>8)&255,b=num&255;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+/* ===== Input ===== */
+addEventListener('keydown',e=>{
+  if(e.key==='m'||e.key==='M') toggleMic();
+  if(e.key==='p'||e.key==='P') {paused=!paused}
+  if(e.key==='c'||e.key==='C'){ paletteIndex=(paletteIndex+1)%PALETTES.length; say('Palette changed'); }
+  if(e.key==='0'){ mode='auto'; modeLock=false; nextModeAt=performance.now()+30000; flash('Mode: AUTO'); }
+  if(e.key==='1'){ mode='radial'; modeLock=true; flash('Mode: RADIAL'); }
+  if(e.key==='2'){ mode='bokeh';  modeLock=true; flash('Mode: BOKEH'); }
+  if(e.key==='3'){ mode='bars';   modeLock=true; flash('Mode: BARS'); }
+  if(e.key==='4'){ mode='ribbon'; modeLock=true; flash('Mode: RIBBON'); }
+});
+function flash(text){ msgEl.textContent=text; clearTimeout(flash._t); flash._t=setTimeout(()=>msgEl.textContent='',1400); }
+
+/* ===== Go ===== */
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
