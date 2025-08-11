@@ -2,262 +2,300 @@ index.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Generative Audio Nebula — Modes + Beats (Dual-Layer)</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Visualizer Pack — Radial • Bokeh • Bars • Ribbon</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { margin:0; height:100%; background:#0b0d10; overflow:hidden; }
-  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
-  #hud {
-    position:fixed; left:12px; right:12px; bottom:12px; z-index:3;
-    display:flex; justify-content:space-between; align-items:flex-end;
-    font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:#cbd5e1;
-    pointer-events:none;
-  }
-  .chips { display:flex; gap:6px; flex-wrap:wrap; pointer-events:auto; }
-  .chip { background:#0b0d10aa; border:1px solid #1f2937; border-radius:10px; padding:8px 10px; backdrop-filter:blur(6px); }
-  button.chip { cursor:pointer }
-  #msg { position:fixed; left:12px; top:12px; z-index:3; color:#ffb4b4; font:12px system-ui; }
+  html,body{margin:0;height:100%;background:#05070a;overflow:hidden}
+  canvas{position:fixed;inset:0;display:block}
+  #hud{position:fixed;left:12px;right:12px;bottom:12px;z-index:2;display:flex;justify-content:space-between;align-items:flex-end;font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#cbd5e1;pointer-events:none}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;pointer-events:auto}
+  .chip{background:#0b0d10cc;border:1px solid #1f2937;border-radius:10px;padding:8px 10px;backdrop-filter:blur(6px)}
+  button.chip{cursor:pointer}
+  #msg{position:fixed;left:12px;top:12px;z-index:2;color:#ffb4b4;font:12px system-ui}
 </style>
 </head>
 <body>
-<!-- Bottom = fast-fade mono; Top = slow-fade color -->
-<canvas id="layerMono"></canvas>
-<canvas id="layerColor"></canvas>
-
+<canvas id="cv"></canvas>
 <div id="msg"></div>
 <div id="hud">
   <div class="chips">
     <button class="chip" id="micBtn">🎤 Enable Mic</button>
-    <span class="chip">Modes: 1 Nebula • 2 Vortex • 3 Wave • 4 Chaos • 0 Auto</span>
-    <span class="chip">+ / − = particles</span>
-    <span class="chip">R = reseed • C = palette • X = soft clear • ⇧X = hard clear</span>
+    <span class="chip">Modes: 1 Radial • 2 Bokeh • 3 Bars • 4 Ribbon • 0 Auto</span>
+    <span class="chip">P = pause • C = palette</span>
   </div>
   <div class="chip" id="fps">…</div>
 </div>
 
 <script>
-/* ====== TUNING (bigger strokes, dual fade) ====== */
-let PARTICLE_COUNT = 50;               // clamped to 5..100
-const MIN_PARTICLES = 5, MAX_PARTICLES = 100;
+/* ===== Basics ===== */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const fpsEl=document.getElementById('fps'), micBtn=document.getElementById('micBtn'), msgEl=document.getElementById('msg');
+let W=0,H=0, dpr=1, paused=false, mode='auto', modeLock=false, nextModeAt=performance.now()+30000;
+let last=0,acc=0,frames=0;
 
-const SETTINGS = {
-  step: 2.0,           // base motion
-  lineWidthColor: 1.6, // colorful stroke size (bigger!)
-  lineWidthMono: 2.6,  // mono under-stroke (thicker!)
-  noiseScale: 0.0009,
-  fieldSpeed: 0.34,
-  fadeMono: 0.08,      // FAST fade (kills gray quickly)
-  fadeColor: 0.008,    // SLOW fade (colors linger)
-  bg: "#0b0d10",
-  palettes: [
-    ["#A7C7E7","#6EB5FF","#6B9AC4","#E9F1FF","#C1FFD7"],
-    ["#FF6B6B","#FFD93D","#6BCB77","#4D96FF","#B983FF"],
-    ["#00C2FF","#00FFC6","#7CFFCB","#F7F7FF","#BDB2FF"],
-    ["#F94144","#F3722C","#F8961E","#90BE6D","#577590"],
-    ["#D1E8E2","#9AD1D4","#6EC5E9","#C490D1","#845EC2"]
-  ]
+const PALETTES=[
+  ["#00c2ff","#00ffc6","#7cffcb","#f7f7ff","#bdb2ff"],
+  ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff","#b983ff"],
+  ["#f94144","#f3722c","#f8961e","#90be6d","#577590"],
+  ["#84fab0","#8fd3f4","#a18cd1","#fbc2eb","#fda085"]
+];
+let paletteIndex=0;
+
+/* ===== Audio ===== */
+const audio={ctx:null,an:null,fft:null,time:null,enabled:false,
+  level:0,bass:0,mids:0,treble:0,centroid:0,bassAvg:0,impact:0,cooldown:0
 };
-/* =============================================== */
 
-const TAU = Math.PI * 2;
-const mono = document.getElementById('layerMono');
-const color = document.getElementById('layerColor');
-const g = mono.getContext('2d', { alpha:false });
-const c = color.getContext('2d', { alpha:true });
-const fpsEl = document.getElementById('fps');
-const msgEl = document.getElementById('msg');
-const micBtn = document.getElementById('micBtn');
-
-let W=0, H=0, frameCount=0, last=0, acc=0, frames=0;
-let particles = [], sparks = [];
-let palette = pick(SETTINGS.palettes);
-let seed = (Math.random()*1e9)|0;
-let flushUntil = 0, mode="auto", modeLock=false, nextModeAt=performance.now()+30000, paused=false;
-
-const audio = { ctx:null, analyser:null, data:null, enabled:false, level:0,
-  bass:0,mids:0,treble:0, centroid:0, bassAvg:0, impact:0, cooldown:0 };
-
-function start(){ resize(); reseed(); requestAnimationFrame(loop); }
-document.readyState === "loading" ? addEventListener('DOMContentLoaded', start) : start();
-
-/* ---------- Mic (optional) ---------- */
 async function enableMic(){
   try{
-    if(!audio.ctx) audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
-    const source = audio.ctx.createMediaStreamSource(stream);
-    audio.analyser = audio.ctx.createAnalyser();
-    audio.analyser.fftSize = 1024;
-    audio.data = new Uint8Array(audio.analyser.frequencyBinCount);
-    source.connect(audio.analyser);
-    audio.enabled = true;
-    say("Mic: ON"); micBtn.textContent = "🎤 Mic: ON (press M to toggle)";
-  }catch{ say("Mic denied — running without mic"); audio.enabled=false; }
+    if(!audio.ctx) audio.ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const src=audio.ctx.createMediaStreamSource(stream);
+    audio.an=audio.ctx.createAnalyser();
+    audio.an.fftSize=2048;
+    audio.fft=new Uint8Array(audio.an.frequencyBinCount);
+    audio.time=new Float32Array(audio.an.fftSize);
+    src.connect(audio.an);
+    audio.enabled=true; say("Mic: ON"); micBtn.textContent="🎤 Mic: ON (press M)";
+  }catch(e){ say("Mic denied — fallback mode"); audio.enabled=false; }
 }
-function toggleMic(){ if(!audio.analyser){ enableMic(); } else { audio.enabled=!audio.enabled; say(audio.enabled?"Mic: ON":"Mic: OFF"); micBtn.textContent = audio.enabled?"🎤 Mic: ON (press M to toggle)":"🎤 Enable Mic"; } }
+function toggleMic(){ if(!audio.an){ enableMic(); } else { audio.enabled=!audio.enabled; say(audio.enabled?"Mic: ON":"Mic: OFF"); micBtn.textContent=audio.enabled?"🎤 Mic: ON (press M)":"🎤 Enable Mic"; } }
 micBtn.addEventListener('click', enableMic);
 
-/* ---------- Core ---------- */
-function reseed(){ seed=(Math.random()*1e9)|0; particles=new Array(PARTICLE_COUNT).fill(0).map(()=>spawn()); hardClear(); flash(`Reseeded • Particles: ${PARTICLE_COUNT}`); }
-function spawn(){ return { x: Math.random()*W, y: Math.random()*H, hue: pick(palette), life:0 }; }
-function hardClear(){ g.globalAlpha=1; g.fillStyle=SETTINGS.bg; g.fillRect(0,0,W,H); c.clearRect(0,0,W,H); }
+/* ===== Helpers ===== */
+function resize(){
+  dpr=Math.min(2,devicePixelRatio||1);
+  W=innerWidth; H=innerHeight;
+  cv.width=W*dpr; cv.height=H*dpr; cv.style.width=W+'px'; cv.style.height=H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', resize); resize();
 
+function lerp(a,b,t){return a+(b-a)*t}
+function clamp(v,a,b){return v<a?a:v>b?b:v}
+function pick(arr){return arr[(Math.random()*arr.length)|0]}
+function hsl(h,s,l,a=1){return `hsla(${h},${s}%,${l}%,${a})`}
+function say(t){msgEl.textContent=t; clearTimeout(say._t); say._t=setTimeout(()=>msgEl.textContent='',1800)}
+
+/* ===== Analysis / Beat ===== */
+function analyze(){
+  // decay impact
+  audio.impact=Math.max(0,audio.impact-0.06);
+
+  if(audio.enabled && audio.an){
+    audio.an.getByteFrequencyData(audio.fft);
+    audio.an.getFloatTimeDomainData(audio.time);
+
+    const f=audio.fft, n=f.length;
+    const b1=Math.floor(n*0.10), m1=Math.floor(n*0.40), t1=Math.floor(n*0.85);
+    audio.bass = bandRMS(f,0,b1);
+    audio.mids = bandRMS(f,b1,m1);
+    audio.treble = bandRMS(f,m1,t1);
+    audio.level = audio.level*0.7 + bandRMS(f,0,t1)*0.3;
+    audio.centroid = centroidNorm(f);
+
+    // Beat on bass
+    const now=performance.now(), alpha=0.9;
+    audio.bassAvg = audio.bassAvg ? (alpha*audio.bassAvg+(1-alpha)*audio.bass) : audio.bass;
+    const beat = (audio.bass > Math.max(0.08, audio.bassAvg*1.5)) && (now>audio.cooldown);
+    if(beat){ audio.impact=1.0; audio.cooldown=now+160; spawnBokehBurst(); }
+  }else{
+    // fallback oscillator
+    const t=performance.now()*0.001;
+    audio.level=(Math.sin(t*1.2)*0.5+0.5)*0.25;
+    audio.bass=audio.mids=audio.treble=audio.centroid=0.2;
+  }
+}
+function bandRMS(arr,a,b){let s=0,n=Math.max(1,b-a);for(let i=a;i<b;i++){const v=arr[i]/255;s+=v*v;}return Math.sqrt(s/n)}
+function centroidNorm(arr){let num=0,den=0,N=arr.length;for(let i=0;i<N;i++){const v=arr[i];num+=i*v;den+=v;}return den? (num/den/N):0.2}
+
+/* ===== Render Loop ===== */
+let t0=performance.now();
+const state={bokeh:[]};
 function loop(t){
-  sampleAudio();
   requestAnimationFrame(loop);
-  if (paused) return;
-  frameCount++;
+  if(paused) return;
 
-  // auto mode cycle
-  if (!modeLock && performance.now() > nextModeAt) { mode = pick(["nebula","vortex","wave","chaos"]); nextModeAt = performance.now()+30000; flash(`Mode: ${mode}`); }
+  analyze();
 
-  // fades: kill gray fast, let colors float
-  const quietBoost = audio.enabled ? (Math.max(0, 0.10 - audio.level) * 0.35) : 0;
-  const softFlush  = (t < flushUntil) ? 0.35 : 0;
-  g.globalAlpha = SETTINGS.fadeMono + quietBoost + softFlush; g.fillStyle = SETTINGS.bg; g.fillRect(0,0,W,H); g.globalAlpha = 1;
-  c.globalAlpha = SETTINGS.fadeColor; c.fillStyle = "transparent"; c.fillRect(0,0,W,H); c.globalAlpha = 1;
+  // auto-cycle modes
+  if(!modeLock && performance.now()>nextModeAt){ mode=pick(['radial','bokeh','bars','ribbon']); nextModeAt=performance.now()+30000; flash(`Mode: ${mode.toUpperCase()}`); }
 
-  // impact decay
-  audio.impact = Math.max(0, audio.impact - 0.06);
+  // Clear with slight trail for nicer feel
+  const fade = 0.08 - audio.level*0.03; // brighter music = less fade
+  ctx.globalAlpha=fade; ctx.fillStyle="#05070a"; ctx.fillRect(0,0,W,H); ctx.globalAlpha=1;
 
-  // sizes & speeds
-  const step = SETTINGS.step * (1 + audio.level*0.8 + audio.impact*0.9);
-  const lwColor = SETTINGS.lineWidthColor * (1 + audio.level*0.4 + audio.impact*0.6);
-  const lwMono  = SETTINGS.lineWidthMono  * (1 + audio.level*0.2 + audio.impact*0.4);
-
-  // glow only on color layer (cheap & pretty)
-  if (frameCount % 2 === 0) { c.shadowColor='rgba(255,255,255,0.14)'; c.shadowBlur=10 + audio.level*22 + audio.impact*26; } else { c.shadowBlur=0; }
-
-  const z = t * 0.001 * (SETTINGS.fieldSpeed * (1 + audio.level*0.3));
-
-  // draw particles (2 strokes each: mono under, color over)
-  g.lineCap=g.lineJoin=c.lineCap=c.lineJoin='round';
-  g.globalCompositeOperation='source-over';
-  c.globalCompositeOperation='screen';
-
-  g.lineWidth = lwMono;
-  c.lineWidth = lwColor;
-
-  for (let p of particles){
-    const a = flowAngle(mode, p.x, p.y, z);
-    const nx = p.x + Math.cos(a)*step;
-    const ny = p.y + Math.sin(a)*step;
-
-    // mono under-stroke (desaturated, fast-fade)
-    g.beginPath(); g.moveTo(p.x, p.y); g.lineTo(nx, ny);
-    g.strokeStyle = 'rgba(170,180,185,0.18)'; g.stroke();
-
-    // color over-stroke (lingers)
-    c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(nx, ny);
-    c.strokeStyle = withAlpha(p.hue, 0.24 + 0.18*Math.random()); c.stroke();
-
-    p.x=nx; p.y=ny; p.life++;
-    if (p.x<-10||p.x>W+10||p.y<-10||p.y>H+10||p.life>1500) Object.assign(p, spawn());
-  }
-
-  // sparks on beats (draw only in color layer)
-  if (sparks.length){
-    const sStep = step * 1.8;
-    c.lineWidth = lwColor * 0.9;
-    for (let s of sparks){
-      const a = flowAngle(mode, s.x, s.y, z) + (Math.random()-0.5)*0.6;
-      const nx = s.x + Math.cos(a)*sStep, ny = s.y + Math.sin(a)*sStep;
-      c.beginPath(); c.moveTo(s.x, s.y); c.lineTo(nx, ny);
-      c.strokeStyle = withAlpha(s.hue, 0.38); c.stroke();
-      s.x=nx; s.y=ny; s.life--;
-    }
-    sparks = sparks.filter(s=>s.life>0);
-  }
-
-  // fps
-  const dt=t-last; last=t; acc+=dt; frames++; if(acc>500){ fpsEl.textContent=`${(1000*frames/acc).toFixed(0)} fps • ${particles.length} pts • ${mode.toUpperCase()} ${audio.enabled?'• mic':''}`; acc=0; frames=0; }
-}
-
-/* ---------- Flow field modes ---------- */
-function flowAngle(mode, x, y, z){
-  const curl = SETTINGS.noiseScale * (1 - Math.min(0.6, audio.centroid*0.6));
   switch(mode){
-    case "vortex": {
-      const cx = W*0.5 + Math.cos(z*0.6)*W*0.18, cy = H*0.5 + Math.sin(z*0.6)*H*0.18;
-      const swirl = Math.atan2(y-cy, x-cx) + Math.PI/2;
-      const curlA = valueNoise(x*curl*1.2, y*curl*1.2, z)*1.6 - 0.8;
-      return swirl + curlA;
+    case 'radial': drawRadial(); break;
+    case 'bokeh':  drawBokeh(); break;
+    case 'bars':   drawBars(); break;
+    case 'ribbon': drawRibbon(); break;
+    case 'auto':
+    default:       drawRadial();
+  }
+
+  // FPS
+  const dt=t-last; last=t; acc+=dt; frames++; if(acc>500){fpsEl.textContent=`${(1000*frames/acc).toFixed(0)} fps • ${mode.toUpperCase()} ${audio.enabled?'• mic':''}`; acc=0; frames=0;}
+}
+
+/* ===== Mode 1 — Radial Spectrum (ring/donut) ===== */
+function drawRadial(){
+  const cx=W/2, cy=H/2, R=Math.min(W,H)*0.28, thickness=Math.min(W,H)*0.02*(1+audio.level*1.2+audio.impact);
+  const segs=96, gap=TAU/segs, hueBase=(performance.now()-t0)*0.02;
+  // base ring
+  ctx.lineCap='round';
+  for(let i=0;i<segs;i++){
+    const ang=i*gap, lv=bandAt(i,segs); // 0..1
+    const h=(hueBase+i*4)%360;
+    const r1=R, r2=R+lv*R*0.8*(0.6+audio.level*0.8)+audio.impact*30;
+    ctx.strokeStyle=hsl(h,90,55,0.9);
+    ctx.lineWidth=thickness*0.65;
+    arcSegment(cx,cy,ang,ang+gap*0.7,r1);
+    ctx.stroke();
+    // spikes
+    ctx.lineWidth=thickness*0.35;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(ang)*r1, cy+Math.sin(ang)*r1);
+    ctx.lineTo(cx+Math.cos(ang)*r2, cy+Math.sin(ang)*r2);
+    ctx.stroke();
+  }
+  // center hole
+  const hole=R*0.35*(1-0.1*audio.level);
+  ctx.globalCompositeOperation='destination-out';
+  ctx.beginPath(); ctx.arc(cx,cy,hole,0,TAU); ctx.fill();
+  ctx.globalCompositeOperation='source-over';
+}
+function arcSegment(cx,cy,a0,a1,r){ctx.beginPath();ctx.arc(cx,cy,r,a0,a1,false)}
+
+/* ===== Mode 2 — Bokeh Beats (pulsing circles) ===== */
+function drawBokeh(){
+  // decay & move circles
+  const arr=state.bokeh;
+  for(let i=arr.length-1;i>=0;i--){
+    const b=arr[i];
+    b.r += b.vr*(1+audio.level*0.8); b.a *= 0.97; b.x += b.vx; b.y += b.vy;
+    if(b.a<0.02) arr.splice(i,1);
+  }
+  // ambient spawn
+  if(arr.length<80 && Math.random()<0.2){
+    arr.push(makeBokeh(Math.random()*W,Math.random()*H, 10+Math.random()*30));
+  }
+  // draw
+  ctx.save();
+  ctx.globalCompositeOperation='screen';
+  for(const b of arr){
+    const grd=ctx.createRadialGradient(b.x,b.y,0,b.x,b.y,b.r);
+    grd.addColorStop(0, b.col);
+    grd.addColorStop(1, b.out);
+    ctx.fillStyle=grd; ctx.globalAlpha=b.a;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+function makeBokeh(x,y,base){
+  const col=pick(PALETTES[paletteIndex]);
+  return {x,y,r:base,vr:0.8+Math.random()*2.2,a:0.9,
+          vx:(Math.random()-0.5)*0.6, vy:(Math.random()-0.5)*0.6,
+          col:hexWithAlpha(col,0.8), out:hexWithAlpha(col,0)}
+}
+function spawnBokehBurst(){
+  // beat burst near center
+  const cx=W/2, cy=H/2, n=12+Math.floor(audio.bass*30);
+  for(let i=0;i<n;i++){
+    const ang=Math.random()*TAU, dist=(Math.random()*0.35+0.1)*Math.min(W,H);
+    const x=cx+Math.cos(ang)*dist, y=cy+Math.sin(ang)*dist;
+    state.bokeh.push(makeBokeh(x,y, 20+Math.random()*60));
+  }
+}
+
+/* ===== Mode 3 — EQ Bars (with reflection) ===== */
+function drawBars(){
+  const cols=64, gap=W/cols, baseY=H*0.65;
+  // reflection gradient
+  const grad=ctx.createLinearGradient(0,baseY,0,H);
+  grad.addColorStop(0,'rgba(255,255,255,0.20)');
+  grad.addColorStop(1,'rgba(255,255,255,0.0)');
+
+  for(let i=0;i<cols;i++){
+    const v=bandAt(i,cols); // 0..1
+    const h=(i/cols*360 + (performance.now()-t0)*0.02)%360;
+    const hgt = v*H*0.45*(0.7+audio.level);
+    // bar
+    ctx.fillStyle=hsl(h,90,55,0.95);
+    const x=i*gap+gap*0.15, w=gap*0.7;
+    ctx.fillRect(x, baseY-hgt, w, hgt);
+    // reflection
+    ctx.save(); ctx.globalCompositeOperation='screen'; ctx.fillStyle=grad;
+    ctx.fillRect(x, baseY+2, w, hgt*0.6); ctx.restore();
+  }
+}
+
+/* ===== Mode 4 — Ribbon Wave (neon lines) ===== */
+function drawRibbon(){
+  // use time-domain waveform (fallback fake if no mic)
+  const N=256; const arr=new Float32Array(N);
+  if(audio.enabled && audio.an){
+    audio.an.getFloatTimeDomainData(audio.time);
+    // downsample
+    const step=Math.floor(audio.time.length/N);
+    for(let i=0;i<N;i++) arr[i]=audio.time[i*step]||0;
+  }else{
+    const t=performance.now()*0.001; for(let i=0;i<N;i++) arr[i]=Math.sin(i*0.1+t)*0.4*Math.sin(i*0.02);
+  }
+  const lines=3, hueBase=(performance.now()-t0)*0.06;
+  ctx.globalCompositeOperation='screen';
+  for(let k=0;k<lines;k++){
+    const y0 = H*0.5 + (k-1)*30;
+    ctx.beginPath();
+    for(let i=0;i<N;i++){
+      const x=i/(N-1)*W;
+      const y=y0 + arr[i]*H*0.25*(0.7+audio.level*1.2);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
     }
-    case "wave":   return Math.sin(x*curl*(0.6+audio.mids*0.8)+z*1.5)*0.9 + Math.cos(y*curl*(0.4+audio.treble*0.8)-z*1.3)*0.9;
-    case "chaos":  return valueNoise(x*curl*1.8, y*curl*1.8, z*1.7)*TAU*2 + (Math.random()-0.5)*0.6*(0.4+audio.treble*0.6);
-    case "nebula":
-    case "auto":
-    default:       return valueNoise(x*curl, y*curl, z) * TAU * 2;
+    ctx.strokeStyle=hsl((hueBase+k*30)%360,90,55,0.9);
+    ctx.lineWidth=2.2 + audio.level*3 + audio.impact*2;
+    ctx.stroke();
   }
+  ctx.globalCompositeOperation='source-over';
 }
 
-/* ---------- Audio analysis + beats ---------- */
-function sampleAudio(){
-  if(audio.enabled && audio.analyser && audio.data){
-    audio.analyser.getByteFrequencyData(audio.data);
-    const arr=audio.data,len=arr.length;
-    const b1=Math.floor(len*0.10), m1=Math.floor(len*0.40), t1=Math.floor(len*0.85);
-    audio.bass=bandRMS(arr,0,b1); audio.mids=bandRMS(arr,b1,m1); audio.treble=bandRMS(arr,m1,t1);
-    audio.level = audio.level*0.7 + bandRMS(arr,0,t1)*0.3;
-    audio.centroid = centroidNorm(arr);
-    // beat detect
-    const now=performance.now(); const alpha=0.9;
-    audio.bassAvg = audio.bassAvg ? (alpha*audio.bassAvg + (1-alpha)*audio.bass) : audio.bass;
-    const beat = (audio.bass > Math.max(0.1, audio.bassAvg*1.5)) && (now > audio.cooldown);
-    if (beat){ audio.impact=1.0; audio.cooldown=now+160; spawnSparks(10 + Math.floor(audio.bass*28)); }
-  } else {
-    const tt=performance.now()*0.001; audio.level=(Math.sin(tt*1.2)*0.5+0.5)*0.25; audio.bass=audio.mids=audio.treble=audio.centroid=0.2;
+/* ===== Spectrum sampling helpers ===== */
+function bandAt(i,total){
+  // Sample the analyser bins nonlinearly (log-ish) for nicer distribution
+  if(!(audio.enabled && audio.an)) {
+    // fallback visual motion
+    const t=performance.now()*0.001;
+    return 0.35*(Math.sin(i*0.3+t*1.3)*0.5+0.5);
   }
+  const f=audio.fft, n=f.length;
+  const idx=Math.floor(Math.pow(i/Math.max(1,total-1), 1.8) * (n*0.9));
+  return clamp(f[idx]/255, 0, 1);
 }
-function bandRMS(arr,a,b){ let s=0,n=Math.max(1,b-a); for(let i=a;i<b;i++){ const v=arr[i]/255; s+=v*v; } return Math.sqrt(s/n); }
-function centroidNorm(arr){ let num=0,den=0,N=arr.length; for(let i=0;i<N;i++){ const v=arr[i]; num+=i*v; den+=v; } return den? (num/den/N):0.2; }
-function spawnSparks(n){ for(let i=0;i<n;i++){ sparks.push({ x:Math.random()*W, y:Math.random()*H, hue:pick(palette), life:14+(Math.random()*10|0) }); } }
 
-/* ---------- Input ---------- */
-addEventListener('keydown', (e)=>{
-  if (e.key==='+'||e.key==='='){ PARTICLE_COUNT=clamp(PARTICLE_COUNT+5,MIN_PARTICLES,MAX_PARTICLES); reseed(); }
-  if (e.key==='-'||e.key==='_'){ PARTICLE_COUNT=clamp(PARTICLE_COUNT-5,MIN_PARTICLES,MAX_PARTICLES); reseed(); }
-  if (e.key==='r'||e.key==='R'){ reseed(); }
-  if (e.key==='c'||e.key==='C'){ palette=pick(SETTINGS.palettes); flash("New palette"); }
-  if (e.key==='m'||e.key==='M'){ toggleMic(); }
-  if ((e.key==='x'||e.key==='X') && !e.shiftKey){ flushUntil=performance.now()+900; flash("Soft clear"); }
-  if ((e.key==='x'||e.key==='X') &&  e.shiftKey){ hardClear(); flash("Hard clear"); }
-  if (e.key==='0'){ mode="auto"; modeLock=false; nextModeAt=performance.now()+30000; flash("Mode: AUTO"); }
-  if (e.key==='1'){ mode="nebula"; modeLock=true; flash("Mode: NEBULA"); }
-  if (e.key==='2'){ mode="vortex"; modeLock=true; flash("Mode: VORTEX"); }
-  if (e.key==='3'){ mode="wave";   modeLock=true; flash("Mode: WAVE"); }
-  if (e.key==='4'){ mode="chaos";  modeLock=true; flash("Mode: CHAOS"); }
+/* ===== Color utils ===== */
+function hexWithAlpha(hex,a){
+  hex=hex.replace('#',''); if(hex.length===3) hex=hex.split('').map(c=>c+c).join('');
+  const num=parseInt(hex,16), r=(num>>16)&255,g=(num>>8)&255,b=num&255;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+/* ===== Input ===== */
+addEventListener('keydown',e=>{
+  if(e.key==='m'||e.key==='M') toggleMic();
+  if(e.key==='p'||e.key==='P') {paused=!paused}
+  if(e.key==='c'||e.key==='C'){ paletteIndex=(paletteIndex+1)%PALETTES.length; say('Palette changed'); }
+  if(e.key==='0'){ mode='auto'; modeLock=false; nextModeAt=performance.now()+30000; flash('Mode: AUTO'); }
+  if(e.key==='1'){ mode='radial'; modeLock=true; flash('Mode: RADIAL'); }
+  if(e.key==='2'){ mode='bokeh';  modeLock=true; flash('Mode: BOKEH'); }
+  if(e.key==='3'){ mode='bars';   modeLock=true; flash('Mode: BARS'); }
+  if(e.key==='4'){ mode='ribbon'; modeLock=true; flash('Mode: RIBBON'); }
 });
+function flash(text){ msgEl.textContent=text; clearTimeout(flash._t); flash._t=setTimeout(()=>msgEl.textContent='',1400); }
 
-/* ---------- Utils ---------- */
-function clamp(v,min,max){ return v<min?min:v>max?max:v; }
-function pick(arr){ return arr[(Math.random()*arr.length)|0]; }
-function withAlpha(hex, a){ hex=hex.replace('#',''); if(hex.length===3){ hex=hex.split('').map(c=>c+c).join(''); } const num=parseInt(hex,16); const r=(num>>16)&255,g=(num>>8)&255,b=num&255; return `rgba(${r},${g},${b},${a})`; }
-function flash(text){ const base='Modes: 1 Nebula • 2 Vortex • 3 Wave • 4 Chaos • 0 Auto  |  +/− particles • R reseed • C palette • X soft clear'; msgEl.textContent=`${base}  —  ${text}`; clearTimeout(flash._t); flash._t=setTimeout(()=>{ msgEl.textContent=base; },1500); }
-function say(text){ msgEl.textContent=text; clearTimeout(say._t); say._t=setTimeout(()=>msgEl.textContent='',1800); }
-
-/* ---------- Noise (seeded value-noise) ---------- */
-function valueNoise(x, y, z=0){
-  const xi=Math.floor(x), yi=Math.floor(y), zi=Math.floor(z);
-  const xf=x-xi, yf=y-yi, zf=z-zi;
-  const u=fade(xf), v=fade(yf), w=fade(zf);
-  const aaa=hash3(xi,yi,zi), aab=hash3(xi,yi,zi+1);
-  const aba=hash3(xi,yi+1,zi), abb=hash3(xi,yi+1,zi+1);
-  const baa=hash3(xi+1,yi,zi), bab=hash3(xi+1,yi,zi+1);
-  const bba=hash3(xi+1,yi+1,zi), bbb=hash3(xi+1,yi+1,zi+1);
-  const x1=lerp(aaa,baa,u), x2=lerp(aba,bba,u), y1=lerp(x1,x2,v);
-  const x3=lerp(aab,bab,u), x4=lerp(abb,bbb,u), y2=lerp(x3,x4,v);
-  return lerp(y1,y2,w);
-}
-function hash3(x,y,z){ let h=x*374761393 + y*668265263 + z*1442695041 + seed; h=(h^(h>>13))*1274126177; h^=h>>16; return (h>>>0)/4294967295; }
-const fade=t=>t*t*t*(t*(t*6-15)+10);
-const lerp=(a,b,t)=>a+(b-a)*t;
-
-/* ---------- Resize ---------- */
-function resize(){ W=innerWidth|0; H=innerHeight|0; mono.width=W; mono.height=H; color.width=W; color.height=H; hardClear(); }
-addEventListener('resize', resize);
+/* ===== Go ===== */
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
