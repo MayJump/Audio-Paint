@@ -4,35 +4,48 @@ index.html
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Spicy Particle Trails — 5 to 100</title>
+<title>Spicy Particle Trails — Mic + Soft Clear</title>
 <style>
   :root { color-scheme: dark; }
   html, body { margin:0; height:100%; background:#0b0d10; overflow:hidden; }
   canvas { display:block; position:fixed; inset:0; }
-  #msg {
-    position:fixed; left:12px; bottom:12px; z-index:2;
-    font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-    color:#cbd5e1; background:#0b0d10aa; border:1px solid #1f2937; border-radius:10px;
-    padding:8px 10px; backdrop-filter:blur(6px);
+  #hud {
+    position:fixed; left:12px; right:12px; bottom:12px; z-index:2;
+    display:flex; justify-content:space-between; align-items:flex-end;
+    font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:#cbd5e1;
   }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { background:#0b0d10aa; border:1px solid #1f2937; border-radius:10px; padding:8px 10px; backdrop-filter:blur(6px); }
+  button.chip { cursor:pointer }
+  #msg { position:fixed; left:12px; top:12px; z-index:2; color:#ffb4b4; font:12px system-ui; }
 </style>
 </head>
 <body>
 <canvas id="scene"></canvas>
-<div id="msg">+ / − = particles • R = reseed • X = clear</div>
+<div id="msg"></div>
+<div id="hud">
+  <div class="chips">
+    <button class="chip" id="micBtn">🎤 Enable Mic</button>
+    <span class="chip">+ / − = particles</span>
+    <span class="chip">R = reseed</span>
+    <span class="chip">C = palette</span>
+    <span class="chip">X = soft clear</span>
+    <span class="chip">Shift+X = hard clear</span>
+  </div>
+  <div class="chip" id="fps">…</div>
+</div>
 
 <script>
 /* ====== TUNING ====== */
-let PARTICLE_COUNT = 50;        // live-adjustable: clamped to 5..100
-const MIN_PARTICLES   = 5;
-const MAX_PARTICLES   = 100;
+let PARTICLE_COUNT = 50;               // live-adjustable: clamped to 5..100
+const MIN_PARTICLES = 5, MAX_PARTICLES = 100;
 
 const SETTINGS = {
   step: 2.0,         // longer per-frame motion
   lineWidth: 1.2,    // bolder strokes for few particles
   noiseScale: 0.0009,// tighter curls
   fieldSpeed: 0.34,  // field drift
-  fadeAlpha: 0.012,  // slower fade = longer trails
+  fadeAlpha: 0.012,  // base trail fade (we modulate this live)
   bg: "#0b0d10",
   palettes: [
     ["#A7C7E7","#6EB5FF","#6B9AC4","#E9F1FF","#C1FFD7"],
@@ -47,12 +60,20 @@ const SETTINGS = {
 const TAU = Math.PI * 2;
 const canvas = document.getElementById('scene');
 const ctx = canvas.getContext('2d', { alpha:false });
+const fpsEl = document.getElementById('fps');
 const msgEl = document.getElementById('msg');
+const micBtn = document.getElementById('micBtn');
 
-let W=0, H=0, frameCount=0;
+let W=0, H=0, frameCount=0, last=0, acc=0, frames=0;
 let particles = [];
 let palette = pick(SETTINGS.palettes);
 let seed = (Math.random()*1e9)|0;
+let flushUntil = 0; // soft-clear timer (ms timestamp)
+
+const audio = {
+  ctx: null, analyser: null, data: null,
+  enabled: false, level: 0
+};
 
 function start(){
   resize();
@@ -61,24 +82,42 @@ function start(){
 }
 document.readyState === "loading" ? addEventListener('DOMContentLoaded', start) : start();
 
+/* ---------- Mic (optional) ---------- */
+async function enableMic(){
+  try{
+    if(!audio.ctx) audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    const source = audio.ctx.createMediaStreamSource(stream);
+    audio.analyser = audio.ctx.createAnalyser();
+    audio.analyser.fftSize = 1024;
+    audio.data = new Uint8Array(audio.analyser.frequencyBinCount);
+    source.connect(audio.analyser);
+    audio.enabled = true;
+    say("Mic: ON");
+    micBtn.textContent = "🎤 Mic: ON (press M to toggle)";
+  }catch(e){
+    say("Mic denied — running without mic");
+    audio.enabled = false;
+  }
+}
+function toggleMic(){
+  if(!audio.analyser){ enableMic(); return; }
+  audio.enabled = !audio.enabled;
+  say(audio.enabled ? "Mic: ON" : "Mic: OFF");
+  micBtn.textContent = audio.enabled ? "🎤 Mic: ON (press M to toggle)" : "🎤 Enable Mic";
+}
+micBtn.addEventListener('click', enableMic);
+
 /* ---------- Core ---------- */
 function reseed(){
   seed = (Math.random()*1e9)|0;
-  palette = pick(SETTINGS.palettes);
   particles = new Array(PARTICLE_COUNT).fill(0).map(()=>spawn());
-  hardClear();
-  flashMsg(`Reseeded • Particles: ${PARTICLE_COUNT}`);
+  hardClear(); // show fresh trails but keep the vibe (no pause)
+  flash("Reseeded • Particles: " + PARTICLE_COUNT);
 }
-
 function spawn(){
-  return {
-    x: Math.random()*W,
-    y: Math.random()*H,
-    hue: pick(palette),
-    life: 0
-  };
+  return { x: Math.random()*W, y: Math.random()*H, hue: pick(palette), life: 0 };
 }
-
 function hardClear(){
   ctx.globalAlpha = 1;
   ctx.fillStyle = SETTINGS.bg;
@@ -95,34 +134,40 @@ function hardClear(){
 }
 
 function loop(t){
+  // audio sampling
+  sampleAudio();
+
   requestAnimationFrame(loop);
   frameCount++;
 
-  // long trails
-  ctx.globalAlpha = SETTINGS.fadeAlpha;
+  // dynamic fade: base + extra when mic is quiet + soft flush when X pressed
+  const quietBoost = audio.enabled ? (Math.max(0, 0.10 - audio.level) * 0.35) : 0; // clear faster when quiet
+  const softFlush  = (t < flushUntil) ? 0.25 : 0; // quick wipe for ~1s
+  const fade = SETTINGS.fadeAlpha + quietBoost + softFlush;
+
+  ctx.globalAlpha = fade;
   ctx.fillStyle = SETTINGS.bg;
   ctx.fillRect(0,0,W,H);
   ctx.globalAlpha = 1;
 
-  // lightweight glow every other frame
-  const glowOn = (frameCount % 2 === 0);
-  if (glowOn) {
+  // lightweight glow every other frame (keeps performance up)
+  if (frameCount % 2 === 0) {
     ctx.shadowColor = 'rgba(255,255,255,0.10)';
-    ctx.shadowBlur  = 10;
+    ctx.shadowBlur  = 8 + audio.level * 18;
   } else {
     ctx.shadowBlur = 0;
   }
 
-  ctx.lineWidth = SETTINGS.lineWidth;
+  ctx.lineWidth = SETTINGS.lineWidth * (1 + audio.level*0.6);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   ctx.globalCompositeOperation = 'lighter';
 
-  const z = t * 0.001 * SETTINGS.fieldSpeed;
+  const z = t * 0.001 * (SETTINGS.fieldSpeed * (1 + audio.level*0.3));
 
   for (let p of particles){
     const angle = valueNoise(p.x*SETTINGS.noiseScale, p.y*SETTINGS.noiseScale, z) * TAU * 2;
-    const nx = p.x + Math.cos(angle) * SETTINGS.step;
-    const ny = p.y + Math.sin(angle) * SETTINGS.step;
+    const nx = p.x + Math.cos(angle) * (SETTINGS.step * (1 + audio.level*1.0));
+    const ny = p.y + Math.sin(angle) * (SETTINGS.step * (1 + audio.level*1.0));
 
     ctx.beginPath();
     ctx.moveTo(p.x, p.y);
@@ -130,16 +175,36 @@ function loop(t){
     ctx.strokeStyle = withAlpha(p.hue, 0.09 + 0.16*Math.random());
     ctx.stroke();
 
-    p.x = nx; p.y = ny;
-    p.life++;
+    p.x = nx; p.y = ny; p.life++;
 
-    // wrap & refresh
     if (p.x < -10 || p.x > W+10 || p.y < -10 || p.y > H+10 || p.life > 1500){
       Object.assign(p, spawn());
     }
   }
-
   ctx.globalCompositeOperation = 'source-over';
+
+  // fps meter
+  const dt = t-last; last=t; acc+=dt; frames++;
+  if(acc>500){
+    fpsEl.textContent = `${(1000*frames/acc).toFixed(0)} fps • ${particles.length} pts ${audio.enabled?'• mic':''}`;
+    acc=0; frames=0;
+  }
+}
+
+/* ---------- Audio sampling ---------- */
+function sampleAudio(){
+  if(audio.enabled && audio.analyser && audio.data){
+    audio.analyser.getByteFrequencyData(audio.data);
+    const len = audio.data.length, start = Math.floor(len*0.1), end = Math.floor(len*0.85);
+    let sumSq = 0, n=0; for(let i=start;i<end;i++){ const v = audio.data[i]/255; sumSq += v*v; n++; }
+    const rms = Math.sqrt(sumSq/Math.max(1,n));
+    // gentle smoothing
+    audio.level = audio.level*0.7 + rms*0.3; // ~0..1
+  } else {
+    // slow breathing when no mic
+    const tt = performance.now()*0.001;
+    audio.level = (Math.sin(tt*1.2)*0.5 + 0.5) * 0.25;
+  }
 }
 
 /* ---------- Input ---------- */
@@ -155,13 +220,21 @@ addEventListener('keydown', (e)=>{
   if (e.key === 'r' || e.key === 'R') {
     reseed();
   }
-  if (e.key === 'x' || e.key === 'X') {
-    hardClear();
-    flashMsg('Cleared');
-  }
   if (e.key === 'c' || e.key === 'C') {
     palette = pick(SETTINGS.palettes);
-    flashMsg('New palette');
+    flash("New palette");
+  }
+  if (e.key === 'm' || e.key === 'M') {
+    toggleMic();
+  }
+  // X = soft clear (fade flush ~1s). Shift+X = hard clear (instant wipe).
+  if ((e.key === 'x' || e.key === 'X') && !e.shiftKey) {
+    flushUntil = performance.now() + 1000; // ~1 second of stronger fade
+    flash("Soft clear");
+  }
+  if ((e.key === 'x' || e.key === 'X') && e.shiftKey) {
+    hardClear();
+    flash("Hard clear");
   }
 });
 
@@ -175,11 +248,13 @@ function withAlpha(hex, a){
   const r=(num>>16)&255, g=(num>>8)&255, b=num&255;
   return `rgba(${r},${g},${b},${a})`;
 }
-function flashMsg(text){
-  msgEl.textContent = `+ / − = particles • R = reseed • X = clear  —  ${text}`;
-  clearTimeout(flashMsg._t);
-  flashMsg._t = setTimeout(()=>{ msgEl.textContent = '+ / − = particles • R = reseed • X = clear'; }, 1600);
+function flash(text){
+  const base = '+ / − = particles • R = reseed • C = palette • X = soft clear';
+  msgEl.textContent = `${base}  —  ${text}`;
+  clearTimeout(flash._t);
+  flash._t = setTimeout(()=>{ msgEl.textContent = base; }, 1400);
 }
+function say(text){ msgEl.textContent = text; clearTimeout(say._t); say._t=setTimeout(()=>msgEl.textContent='',2000); }
 
 /* ---------- Noise (seeded value-noise) ---------- */
 function valueNoise(x, y, z=0){
