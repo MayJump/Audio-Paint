@@ -1,3 +1,310 @@
 index.html
-# Audio-Paint
-Audio Paint
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Audio Paint — Reactive Particles</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height:100%; margin:0; background:#0b0d10; overflow:hidden; }
+  canvas#scene { position:fixed; inset:0; width:100vw; height:100vh; display:block; z-index:0; }
+  .hud{
+    position:fixed; left:12px; right:12px; bottom:12px;
+    display:flex; justify-content:space-between; align-items:flex-end;
+    pointer-events:none; font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    color:#aab2c0; opacity:.92; z-index:2;
+  }
+  .hud .left{pointer-events:auto; display:flex; flex-wrap:wrap; gap:6px;}
+  .chip{
+    background:#11161caa; border:1px solid #1e2a35; border-radius:10px;
+    padding:8px 10px; backdrop-filter:blur(6px);
+  }
+  button.chip { cursor:pointer; pointer-events:auto; }
+  .muted { opacity:.7 }
+  #msg { position:fixed; top:12px; left:12px; color:#ffb4b4; font:12px system-ui; z-index:3; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="msg"></div>
+
+<div class="hud">
+  <div class="left">
+    <button class="chip" id="micBtn">🎤 Enable Mic</button>
+    <span class="chip muted">M = mic on/off</span>
+    <span class="chip muted">R = reseed</span>
+    <span class="chip muted">C = palette</span>
+    <span class="chip muted">P = pause</span>
+    <span class="chip muted">S = save PNG</span>
+  </div>
+  <div class="chip" id="fps">…</div>
+</div>
+
+<script>
+/* ========= SETTINGS ========= */
+const SETTINGS = {
+  density: 0.0025,   // particles per pixel (audio mode likes a bit more)
+  step: 0.9,         // base step size (boosted by audio)
+  lineWidth: 0.9,    // base thickness (boosted by audio)
+  noiseScale: 0.0012,// curl size
+  fieldSpeed: 0.3,   // field drift
+  fadeAlpha: 0.04,   // trail persistence
+  bg: "#0b0d10",
+  palettes: [
+    ["#A7C7E7","#6EB5FF","#6B9AC4","#E9F1FF","#C1FFD7"],
+    ["#FF6B6B","#FFD93D","#6BCB77","#4D96FF","#B983FF"],
+    ["#00C2FF","#00FFC6","#7CFFCB","#F7F7FF","#BDB2FF"],
+    ["#F94144","#F3722C","#F8961E","#90BE6D","#577590"],
+    ["#D1E8E2","#9AD1D4","#6EC5E9","#C490D1","#845EC2"]
+  ]
+};
+/* ===================================== */
+
+const TAU = Math.PI*2;
+let seed = (Math.random()*1e9)|0;
+let paused = false;
+
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d', { alpha: false });
+let W=0, H=0, particles=[], palette = pick(SETTINGS.palettes);
+
+const micBtn = document.getElementById('micBtn');
+const msgEl = document.getElementById('msg');
+
+let audio = {
+  ctx: null,
+  analyser: null,
+  data: null,
+  enabled: false,
+  fallback: true, // default to fallback until mic granted
+  level: 0        // 0..1
+};
+
+function start(){
+  resize();
+  reseed();
+  requestAnimationFrame(loop);
+}
+if (document.readyState === "loading") addEventListener('DOMContentLoaded', start); else start();
+
+/* ---------- Audio setup ---------- */
+async function enableMic(){
+  try{
+    // Safari/iOS require user gesture: calling from button click fulfills it
+    if(!audio.ctx) audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = audio.ctx.createMediaStreamSource(stream);
+
+    audio.analyser = audio.ctx.createAnalyser();
+    audio.analyser.fftSize = 1024; // decent resolution
+    audio.data = new Uint8Array(audio.analyser.frequencyBinCount);
+
+    source.connect(audio.analyser);
+    audio.enabled = true;
+    audio.fallback = false;
+    micBtn.textContent = "🎤 Mic: ON (toggle M)";
+    micBtn.classList.add('muted'); // visually “set”
+    msg("");
+  }catch(e){
+    audio.enabled = false;
+    audio.fallback = true; // animate without mic
+    micBtn.textContent = "🎤 Mic blocked — using fallback";
+    msg("Mic permission denied. Running in fallback mode.");
+  }
+}
+
+function toggleMic(){
+  if(!audio.ctx || !audio.analyser){
+    // try to enable if not set up yet
+    enableMic();
+  }else{
+    audio.enabled = !audio.enabled;
+    audio.fallback = !audio.enabled;
+    micBtn.textContent = audio.enabled ? "🎤 Mic: ON (toggle M)" : "🎤 Mic: OFF (toggle M)";
+  }
+}
+
+micBtn.addEventListener('click', enableMic);
+
+/* ---------- Core viz ---------- */
+function reseed(){
+  seed = (Math.random()*1e9)|0;
+  palette = pick(SETTINGS.palettes);
+  const count = Math.max(200, Math.floor(W*H*SETTINGS.density));
+  particles = new Array(count).fill(0).map(()=>({
+    x: Math.random()*W, y: Math.random()*H, hue: pick(palette), life: 0
+  }));
+  clear(true);
+}
+
+function clear(hard=false){
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = SETTINGS.bg;
+  ctx.fillRect(0,0,W,H);
+  if(!hard){
+    const n = 4000;
+    ctx.globalAlpha = 0.04;
+    for(let i=0;i<n;i++){
+      const x = Math.random()*W, y=Math.random()*H;
+      ctx.fillStyle = Math.random() < 0.5 ? "#0b0d10" : "#0c0f13";
+      ctx.fillRect(x,y,1,1);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function loop(t){
+  // sample audio level (0..1)
+  sampleAudio();
+
+  if(!paused){
+    // fade for trails (lighter fade when louder)
+    const fadeBoost = lerp(SETTINGS.fadeAlpha, SETTINGS.fadeAlpha*0.75, audio.level);
+    ctx.globalAlpha = fadeBoost;
+    ctx.fillStyle = SETTINGS.bg;
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+
+    // base stroke width reacts to level
+    const width = SETTINGS.lineWidth * (1 + audio.level*1.3);
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // field speed & step react to level
+    const step = SETTINGS.step * (1 + audio.level*1.5);
+    const z = t * 0.001 * (SETTINGS.fieldSpeed * (1 + audio.level*0.8));
+
+    ctx.globalCompositeOperation = 'lighter';
+    for(let p of particles){
+      const ax = p.x, ay = p.y;
+      const angle = valueNoise(p.x*SETTINGS.noiseScale, p.y*SETTINGS.noiseScale, z) * TAU*2;
+
+      p.x += Math.cos(angle) * step;
+      p.y += Math.sin(angle) * step;
+
+      // subtle color flicker with volume
+      const a = 0.05 + 0.18*Math.random()* (0.6 + audio.level*0.4);
+
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(p.x, p.y);
+      ctx.strokeStyle = withAlpha(p.hue, a);
+      ctx.stroke();
+
+      p.life++;
+      if (p.x< -10 || p.x>W+10 || p.y<-10 || p.y>H+10 || p.life>1500){
+        p.x = Math.random()*W; p.y = Math.random()*H; p.hue = pick(palette); p.life = 0;
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  fpsMeter(t);
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Audio sampling ---------- */
+function sampleAudio(){
+  if(audio.enabled && audio.analyser && audio.data){
+    audio.analyser.getByteFrequencyData(audio.data);
+    // Compute a normalized loudness metric (RMS-like of mid bands)
+    const len = audio.data.length;
+    // Focus on mids (skip the first bins to avoid HVAC rumble)
+    const start = Math.floor(len*0.1), end = Math.floor(len*0.85);
+    let sumSq = 0, n=0;
+    for(let i=start;i<end;i++){ const v = audio.data[i]/255; sumSq += v*v; n++; }
+    const rms = Math.sqrt(sumSq/Math.max(1,n));
+    // Smooth it a bit to avoid jitter
+    audio.level = audio.level*0.65 + rms*0.35;
+  }else{
+    // fallback: gently oscillate with time
+    const t = performance.now()*0.001;
+    audio.level = (Math.sin(t*1.2)*0.5 + 0.5) * 0.35; // 0..~0.35
+  }
+}
+
+/* ----- Value Noise (seeded) ----- */
+function valueNoise(x, y, z=0){
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const u = fade(xf), v = fade(yf), w = fade(zf);
+  const aaa = hash3(xi,   yi,   zi  );
+  const aab = hash3(xi,   yi,   zi+1);
+  const aba = hash3(xi,   yi+1, zi  );
+  const abb = hash3(xi,   yi+1, zi+1);
+  const baa = hash3(xi+1, yi,   zi  );
+  const bab = hash3(xi+1, yi,   zi+1);
+  const bba = hash3(xi+1, yi+1, zi  );
+  const bbb = hash3(xi+1, yi+1, zi+1);
+  const x1 = lerp(aaa, baa, u);
+  const x2 = lerp(aba, bba, u);
+  const y1 = lerp(x1, x2, v);
+  const x3 = lerp(aab, bab, u);
+  const x4 = lerp(abb, bbb, u);
+  const y2 = lerp(x3, x4, v);
+  return lerp(y1, y2, w);
+}
+function hash3(x, y, z){
+  let h = x*374761393 + y*668265263 + z*1442695041 + seed;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h ^= h >> 16;
+  return (h >>> 0) / 4294967295;
+}
+const fade = t => t*t*t*(t*(t*6-15)+10);
+const lerp = (a,b,t)=>a+(b-a)*t;
+
+/* ----- Utils ----- */
+function pick(arr){ return arr[(Math.random()*arr.length)|0]; }
+function withAlpha(hex, a){
+  const {r,g,b} = hexToRGB(hex);
+  return `rgba(${r},${g},${b},${a})`;
+}
+function hexToRGB(hex){
+  hex = hex.replace('#','');
+  if(hex.length===3){ hex = hex.split('').map(c=>c+c).join(''); }
+  const num = parseInt(hex,16);
+  return { r:(num>>16)&255, g:(num>>8)&255, b:num&255 };
+}
+function msg(s){ msgEl.textContent = s || ""; }
+
+/* ----- Size handling ----- */
+function resize(){
+  const w = Math.floor(window.innerWidth);
+  const h = Math.floor(window.innerHeight);
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = w + "px"; canvas.style.height = h + "px";
+  W = w; H = h;
+}
+addEventListener('resize', resize);
+
+/* ----- Keys ----- */
+addEventListener('keydown', (e)=>{
+  if(e.key==='m' || e.key==='M') toggleMic();
+  if(e.key==='r' || e.key==='R') reseed();
+  if(e.key==='c' || e.key==='C'){ palette = pick(SETTINGS.palettes); }
+  if(e.key==='p' || e.key==='P') paused = !paused;
+  if(e.key==='s' || e.key==='S') savePNG();
+});
+
+function savePNG(){
+  const a = document.createElement('a');
+  a.download = 'audio-paint.png';
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+}
+
+/* ----- FPS meter ----- */
+let last=0, acc=0, frames=0;
+function fpsMeter(t){
+  const el = document.getElementById('fps');
+  const dt = t-last; last=t; acc+=dt; frames++;
+  if(acc>500){
+    el.textContent = (1000*frames/acc).toFixed(0) + " fps • " + particles.length + " pts" + (audio.enabled? " • mic" : " • fallback");
+    acc=0; frames=0;
+  }
+}
+</script>
+</body>
+</html>
+
