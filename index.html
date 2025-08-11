@@ -4,7 +4,7 @@ index.html
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>Audio Paint — Mic or Tab Audio</title>
+<title>Audio Paint — Mic Reactive</title>
 <style>
   :root { color-scheme: dark; }
   html, body { height:100%; margin:0; background:#0b0d10; overflow:hidden; }
@@ -32,7 +32,6 @@ index.html
 <div class="hud">
   <div class="left">
     <button class="chip" id="micBtn">🎤 Enable Mic</button>
-    <button class="chip" id="tabBtn">🪟 Use Tab Audio</button>
     <span class="chip muted">M = mic toggle</span>
     <span class="chip muted">R = reseed</span>
     <span class="chip muted">C = palette</span>
@@ -43,14 +42,14 @@ index.html
 </div>
 
 <script>
-/* ========= SETTINGS (longer trails, nice glow) ========= */
+/* ========= INTENSE SETTINGS ========= */
 const SETTINGS = {
-  density: 0.0025,
-  step: 1.4,           // more distance per frame
+  density: 0.0025, // more particles
+  step: 1.4,       // longer motion per frame
   lineWidth: 0.8,
   noiseScale: 0.0011,
   fieldSpeed: 0.32,
-  fadeAlpha: 0.015,    // slower fade = longer streaks
+  fadeAlpha: 0.015, // slower fade = longer trails
   bg: "#0b0d10",
   palettes: [
     ["#A7C7E7","#6EB5FF","#6B9AC4","#E9F1FF","#C1FFD7"],
@@ -60,8 +59,9 @@ const SETTINGS = {
     ["#D1E8E2","#9AD1D4","#6EC5E9","#C490D1","#845EC2"]
   ]
 };
-const SUBSTEPS = 3;   // micro-steps per frame for silky trails
-/* ======================================================= */
+// silky trails: multiple micro-steps per frame (raise for more, drop if FPS dips)
+const SUBSTEPS = 3;
+/* ==================================== */
 
 const TAU = Math.PI*2;
 let seed = (Math.random()*1e9)|0;
@@ -72,7 +72,6 @@ const ctx = canvas.getContext('2d', { alpha: false });
 let W=0, H=0, particles=[], palette = pick(SETTINGS.palettes);
 
 const micBtn = document.getElementById('micBtn');
-const tabBtn = document.getElementById('tabBtn');
 const msgEl  = document.getElementById('msg');
 
 let audio = {
@@ -91,14 +90,23 @@ function start(){
 }
 if (document.readyState === "loading") addEventListener('DOMContentLoaded', start); else start();
 
-/* ---------- Audio: Mic ---------- */
+/* ---------- Audio: Mic only ---------- */
 async function enableMic(){
   try{
     if(!audio.ctx) audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    useAudioStream(stream, "Mic: ON");
+    const source = audio.ctx.createMediaStreamSource(stream);
+
+    audio.analyser = audio.ctx.createAnalyser();
+    audio.analyser.fftSize = 1024;
+    audio.data = new Uint8Array(audio.analyser.frequencyBinCount);
+
+    source.connect(audio.analyser);
+    audio.enabled = true;
+    audio.fallback = false;
+    msg("Mic: ON");
   }catch(e){
-    msg("Mic permission denied. Using fallback.");
+    msg("Mic permission denied. Using fallback animation.");
     audio.enabled = false; audio.fallback = true;
   }
 }
@@ -106,50 +114,7 @@ function toggleMic(){
   if(!audio.ctx || !audio.analyser){ enableMic(); }
   else { audio.enabled = !audio.enabled; audio.fallback = !audio.enabled; msg(audio.enabled?"Mic: ON":"Mic: OFF"); }
 }
-
-/* ---------- Audio: Tab (Chrome/Edge) ---------- */
-/* Chrome often omits audio if you ask for audio-only. Ask for video+audio,
-   then immediately stop the video track. Select 'Chrome Tab' + check 'Share tab audio'. */
-async function enableTabAudio(){
-  try{
-    if(!audio.ctx) audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
-
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,   // needed to get the Chrome Tab picker reliably
-      audio: true
-    });
-
-    const aTracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
-    if (!aTracks || aTracks.length === 0) {
-      msg("No tab audio track was shared. Pick 'Chrome Tab' and check 'Share tab audio'.");
-      stream.getVideoTracks().forEach(t => t.stop());
-      return;
-    }
-
-    // We don't need the video; stop it so the share UI goes away
-    stream.getVideoTracks().forEach(t => t.stop());
-
-    useAudioStream(stream, "Tab audio connected ✔");
-  }catch(e){
-    msg("Tab audio not available/denied. Use Chrome/Edge → pick a tab → check 'Share tab audio'.");
-  }
-}
-
-/* ---------- Common: use audio stream ---------- */
-function useAudioStream(stream, label){
-  const source = (audio.ctx.createMediaStreamSource(stream));
-  audio.analyser = audio.ctx.createAnalyser();
-  audio.analyser.fftSize = 1024;
-  audio.data = new Uint8Array(audio.analyser.frequencyBinCount);
-  source.connect(audio.analyser);
-  audio.enabled = true;
-  audio.fallback = false;
-  msg(label);
-}
-
-/* ---------- UI ---------- */
 micBtn.addEventListener('click', enableMic);
-tabBtn.addEventListener('click', enableTabAudio);
 
 /* ---------- Core viz ---------- */
 function reseed(){
@@ -201,7 +166,6 @@ function loop(t){
 
     ctx.globalCompositeOperation = 'lighter';
     for (let p of particles) {
-      let ax = p.x, ay = p.y;
       const stepLen = stepBase / SUBSTEPS;
 
       for (let s = 0; s < SUBSTEPS; s++) {
@@ -237,10 +201,11 @@ function sampleAudio(){
     const len = audio.data.length, start = Math.floor(len*0.1), end = Math.floor(len*0.85);
     let sumSq = 0, n=0; for(let i=start;i<end;i++){ const v = audio.data[i]/255; sumSq += v*v; n++; }
     const rms = Math.sqrt(sumSq/Math.max(1,n));
-    audio.level = audio.level*0.65 + rms*0.35;
+    audio.level = audio.level*0.65 + rms*0.35; // smoothed loudness 0..1
   }else{
-    const t = performance.now()*0.001;
-    audio.level = (Math.sin(t*1.2)*0.5 + 0.5) * 0.35; // graceful fallback
+    // graceful fallback: breathe when no mic
+    const tt = performance.now()*0.001;
+    audio.level = (Math.sin(tt*1.2)*0.5 + 0.5) * 0.35;
   }
 }
 
@@ -305,7 +270,7 @@ function fpsMeter(t){
   const el = document.getElementById('fps');
   const dt = t-last; last=t; acc+=dt; frames++;
   if(acc>500){
-    el.textContent = (1000*frames/acc).toFixed(0) + " fps • " + particles.length + " pts" + (audio.enabled? " • audio":" • fallback");
+    el.textContent = (1000*frames/acc).toFixed(0) + " fps • " + particles.length + " pts" + (audio.enabled? " • mic":" • fallback");
     acc=0; frames=0;
   }
 }
